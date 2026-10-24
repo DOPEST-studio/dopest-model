@@ -1,0 +1,17 @@
+{
+ "temperatures": {
+  "choice": 4.709,
+  "noul": 7.378,
+  "score": 4.191
+ },
+ "noul_floor": 0.801,
+ "fitted_on": {
+  "choice": "JevBench public v1.2 (139 items)",
+  "noul": "JevBench public v1.2 (74 items)",
+  "score": "DOPEST block B held-out test split (627 items)",
+  "note": "yes/no answers inside (0.2, 0.8) are moved to the floor on their own side (JevBench abstention rule)"
+ },
+ "model": "pilot-31b-ab-bidir-full",
+ "bidir": "full",
+ "readout": "option-letter logits, softcap 30"
+}
