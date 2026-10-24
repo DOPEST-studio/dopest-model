@@ -33,11 +33,12 @@ distribution. Two things differ from a plain causal readout:
 2. **Calibration as a shipped artifact** (`calibration.json`): one temperature per question type and a yes/no commit
    floor of 0.801 (an answer with P(yes) between 0.2 and 0.8 is moved to the floor on its own side, because
    JevBench scores such answers as abstentions).
-3. **Two option orders for choice questions** (`--orders 2`, the default): the options are read in the given order
+3. **Optional second option order for choice questions** (`--orders 2`): the options are read in the given order
    and in reverse, and the two distributions are averaged by option. The adapter was trained with shuffled options,
    so the orders disagree on only 4% of choice items; averaging adds a little calibration (+0.3 on OpenDecisions,
-   +0.9 on the public JevBench items, both inside their intervals) for twice the choice-question latency.
-   `--orders 1` restores the single pass.
+   +0.9 on the public JevBench items, both inside their intervals) for twice the choice-question latency and about
+   70% more input tokens per decision. Off by default: the extra tokens would put the model outside the JevBench
+   Jev-class cost cap (twice the reference model's cost per decision).
 
 ## Serving
 
@@ -58,9 +59,10 @@ Hardware: one GPU with 80 GB (bf16 weights 62 GB; measured on one H100 80 GB). D
 transformers 5.20, peft 0.21, fastapi, uvicorn. States longer than about 12k tokens are truncated, keeping the start.
 
 Measured on one H100 80 GB, one request at a time, over loopback, on the 231 public JevBench items with a single
-option order: median 120 ms, p95 751 ms (states of up to 3.7k tokens), 702 input tokens per decision; with two
-orders, choice questions take twice as long. The server passes JevBench's adapter conformance kit (`check_adapter`
-with the `typesafe` adapter: 4 fixture tasks, 0 violations).
+option order: median 120 ms, p95 751 ms (states of up to 3.7k tokens), 702 input tokens per decision (about
+0.063 USD per 1,000 decisions at the board's reference price for the base model); with `--orders 2`, choice
+questions take twice as long. The server passes JevBench's adapter conformance kit (`check_adapter` with the
+`typesafe` adapter: 4 fixture tasks, 0 violations).
 
 ## Training data
 
@@ -89,11 +91,12 @@ temperatures from a different set than the one scored:
 
 | Set | Capability | Intelligence | Calibration |
 |---|---|---|---|
-| OpenDecisions (2,352 items; shipped calibration, two orders) | 86.5 | 81.4 | 91.6 |
-| JevBench public v1.2 (231 items; shipped calibration, two orders) | 82.9 | 74.1 | 91.7 |
+| OpenDecisions (2,352 items; shipped calibration, one option order) | 86.2 | 81.2 | 91.1 |
+| JevBench public v1.2 (231 items; shipped calibration, one option order) | 82.0 | 73.7 | 90.2 |
 
-The shipped calibration takes the choice and yes/no temperatures from the public JevBench items, so the public-set
-row is not a held-out number for calibration; its accuracy is.
+With `--orders 2` the same runs score 86.5 and 82.9. The shipped calibration takes the choice and yes/no
+temperatures from the public JevBench items, so the public-set row is not a held-out number for calibration; its
+accuracy is.
 
 For reference, the frozen base read causally scores 80.9 on OpenDecisions under the same procedure; the frozen base
 with the bidirectional readout 85.0; this adapter adds calibration on top. The public set is small: differences

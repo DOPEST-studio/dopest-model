@@ -16,9 +16,10 @@ uv run python -m dopest_model.serve --model google/gemma-4-31B-it --adapter dope
 ```
 
 The server speaks the TypeSafe wire format (`POST /v1/systemone`, `GET /health`); the docstring of
-`src/dopest_model/serve.py` gives the request and response shapes. `--orders 1` turns off the two-order averaging on
-choice questions. `--bidir full` must stay on: the adapter was trained with bidirectional attention inside the prompt
-on the global-attention layers, and the plain causal readout is a different model.
+`src/dopest_model/serve.py` gives the request and response shapes. `--orders 2` reads choice questions in both option
+orders and averages the two distributions (off by default: about 70% more input tokens per decision, which is more
+than the JevBench Jev-class cost cap allows). `--bidir full` must stay on: the adapter was trained with bidirectional
+attention inside the prompt on the global-attention layers, and the plain causal readout is a different model.
 
 ## Evaluate
 

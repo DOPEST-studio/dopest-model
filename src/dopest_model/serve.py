@@ -156,8 +156,9 @@ def main() -> None:
     parser.add_argument("--adapter", default=None, help="LoRA adapter directory or Hugging Face repo")
     parser.add_argument("--calibration", required=True)
     parser.add_argument("--bidir", default="full", help="'full' (as trained) or '' for causal attention")
-    parser.add_argument("--orders", type=int, default=2, choices=(1, 2),
-                        help="read choice questions in one option order, or in both and average (default)")
+    parser.add_argument("--orders", type=int, default=1, choices=(1, 2),
+                        help="read choice questions in one option order (default), or in both and average "
+                             "(about 70%% more input tokens per decision: outside the JevBench Jev-class cost cap)")
     parser.add_argument("--name", default="dopest-1.0-31b")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
