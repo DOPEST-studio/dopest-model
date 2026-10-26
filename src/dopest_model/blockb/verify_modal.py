@@ -19,10 +19,9 @@ Prompts are rendered here with the models' own chat templates (checked locally),
 Weights are cached on the Volume 'dopest-hf-cache' (gpt-oss: only the root MXFP4 checkpoint, not original/ or
 metal/). Open weights run on our own containers, so no API provider's terms apply to the outputs.
 """
-from __future__ import annotations
-
 import json
 import os
+import random
 import time
 from pathlib import Path
 
@@ -52,16 +51,53 @@ def token_prompts(tok, convs, **template_kwargs) -> list[list[int]]:
                        add_special_tokens=False) for c in convs]
 
 
+def find_last(seq: list[int], sub: list[int]) -> int:
+    """Start of the last occurrence of sub in seq, or -1."""
+    for i in range(len(seq) - len(sub), -1, -1):
+        if seq[i:i + len(sub)] == sub:
+            return i
+    return -1
+
+
+def last_message(ids: list[int], tok) -> tuple[str | None, str]:
+    """(channel, text) of the last harmony message that is not the analysis channel: gpt-oss answers in `final`, but
+    short structured answers sometimes come in `commentary`. (None, "") when there is no such message."""
+    channel_id, message_id = tok.convert_tokens_to_ids("<|channel|>"), tok.convert_tokens_to_ids("<|message|>")
+    stops = {tok.convert_tokens_to_ids(t) for t in ("<|end|>", "<|return|>", "<|call|>")}
+    found = (None, "")
+    i = 0
+    while i < len(ids):
+        if ids[i] == channel_id and message_id in ids[i + 1:i + 8]:
+            j = ids.index(message_id, i + 1)
+            name = tok.decode(ids[i + 1:j], skip_special_tokens=True).strip()
+            k = j + 1
+            while k < len(ids) and ids[k] not in stops:
+                k += 1
+            if name != "analysis":
+                found = (name, tok.decode(ids[j + 1:k], skip_special_tokens=True))
+            i = k
+        i += 1
+    return found
+
+
+def generation_stats(rows: list[dict], load_s: float, t0: float) -> dict:
+    return {"rows": rows, "container": os.environ.get("MODAL_TASK_ID", "?"), "load_s": load_s,
+            "infer_s": time.perf_counter() - t0, "out_tokens": sum(r["tokens"] for r in rows)}
+
+
 @app.cls(image=image, gpu="H100", **CONTAINER)
 class Qwen:
+    eager: bool = modal.parameter(default=True)     # False for generation jobs: CUDA graphs make decoding faster
+
     @modal.enter()
     def load(self):
         from vllm import LLM
         t0 = time.perf_counter()
         # text only (no vision profiling); the hybrid model needs a state block per running sequence, so cap the
         # batch; eager mode skips torch.compile and CUDA graphs, which a one-token prefill readout does not use
-        self.llm = LLM(model=QWEN, max_model_len=16384, gpu_memory_utilization=0.92, max_num_seqs=256,
-                       enforce_eager=True, limit_mm_per_prompt={"image": 0, "video": 0})
+        self.llm = LLM(model=QWEN, max_model_len=16384, gpu_memory_utilization=0.92,
+                       max_num_seqs=256 if self.eager else 96, enforce_eager=self.eager,
+                       limit_mm_per_prompt={"image": 0, "video": 0})
         hf_cache.commit()
         self.tok = self.llm.get_tokenizer()
         self.load_s = time.perf_counter() - t0
@@ -111,6 +147,36 @@ class Qwen:
                          "n_tokens": len(t), "seconds": 0.0})
         return rows
 
+    @modal.method()
+    def generate(self, convs: list[list[dict]], max_tokens: int = 6000, think_budget: int = 0) -> dict:
+        """Full generations for the replica pipeline. think_budget 0: thinking off, the answer is generated directly.
+        Otherwise two passes: the thinking block up to the budget (cut there when longer), then the answer."""
+        from vllm import SamplingParams
+        from vllm.inputs import TokensPrompt
+        t0 = time.perf_counter()
+        sampling = dict(temperature=0.7, top_p=0.95, top_k=20)
+        if not think_budget:
+            prompts = token_prompts(self.tok, convs, enable_thinking=False)
+            outs = self.llm.generate([TokensPrompt(prompt_token_ids=p) for p in prompts],
+                                     SamplingParams(max_tokens=max_tokens, **sampling), use_tqdm=False)
+            rows = [{"text": o.outputs[0].text, "tokens": len(o.outputs[0].token_ids),
+                     "finish": o.outputs[0].finish_reason, "thought": False} for o in outs]
+            return generation_stats(rows, self.load_s, t0)
+        end = self.tok.convert_tokens_to_ids("</think>")
+        prompts = token_prompts(self.tok, convs, enable_thinking=True)
+        first = self.llm.generate([TokensPrompt(prompt_token_ids=p) for p in prompts],
+                                  SamplingParams(max_tokens=think_budget, stop_token_ids=[end], **sampling),
+                                  use_tqdm=False)
+        thoughts = [[t for t in o.outputs[0].token_ids if t != end] for o in first]
+        close = self.tok.encode("</think>\n\n", add_special_tokens=False)
+        second = self.llm.generate([TokensPrompt(prompt_token_ids=p + th + close) for p, th in zip(prompts, thoughts)],
+                                   SamplingParams(max_tokens=max_tokens, **sampling), use_tqdm=False)
+        rows = [{"text": o.outputs[0].text, "tokens": len(th) + len(o.outputs[0].token_ids),
+                 "finish": o.outputs[0].finish_reason, "thought": True,
+                 "think_cut": f.outputs[0].finish_reason == "length"}
+                for th, f, o in zip(thoughts, first, second)]
+        return generation_stats(rows, self.load_s, t0)
+
 
 @app.cls(image=image, gpu="H200", **CONTAINER)
 class GptOss:
@@ -156,8 +222,90 @@ class GptOss:
         return {"votes": votes, "container": os.environ.get("MODAL_TASK_ID", "?"), "load_s": self.load_s,
                 "infer_s": time.perf_counter() - t0, "out_tokens": sum(map(len, gens))}
 
+    @modal.method()
+    def generate(self, convs: list[list[dict]], max_tokens: int = 6000, think_budget: int = 0) -> dict:
+        """Full generations (analysis, then the final channel): the final-channel text per conversation. The reasoning
+        effort comes from the chat template; think_budget is accepted for a uniform call and ignored."""
+        from vllm import SamplingParams
+        from vllm.inputs import TokensPrompt
+        t0 = time.perf_counter()
+        prompts = token_prompts(self.tok, convs, reasoning_effort=GPTOSS_EFFORT)
+        outs = self.llm.generate([TokensPrompt(prompt_token_ids=p) for p in prompts],
+                                 SamplingParams(max_tokens=max_tokens, temperature=1.0), use_tqdm=False)
+        rows = []
+        for o in outs:
+            ids = list(o.outputs[0].token_ids)
+            channel, text = last_message(ids, self.tok)
+            rows.append({"text": text, "tokens": len(ids), "finish": o.outputs[0].finish_reason,
+                         "thought": channel is not None, "channel": channel,
+                         **({} if text else {"raw": self.tok.decode(ids[-400:], skip_special_tokens=False)[-600:]})})
+        return generation_stats(rows, self.load_s, t0)
+
 
 VERIFIERS = {"qwen": (Qwen, "H100"), "gptoss": (GptOss, "H200")}
+
+
+@app.local_entrypoint()
+def replica(stage: str, inp: str, out: str, engine: str, blind: str = "", chunk: int = 48, limit: int = 0,
+            max_tokens: int = 6000, think_budget: int = 0):
+    """One stage of the replica pipeline on one engine. Rows are appended to --out; a rerun skips the rows that
+    succeeded and retries the failed ones (downstream readers take the last row of an id). --think-budget N (Qwen):
+    at most N thinking tokens before the answer, 0 = thinking off.
+
+        author:  --inp data/replica/briefs.jsonl (this engine's briefs)        -> {id (brief), ok, why, item}
+        blind:   --inp data/replica/items.jsonl (the other author's items)     -> {id, answer, probs, note, ok}
+        verdict: --inp data/replica/items.jsonl --blind data/replica/blind_<engine>.jsonl -> {id, verdict, reason, fix}
+    """
+    from dopest_model.replica import stages
+    cls, gpu = VERIFIERS[engine]
+    rows_in = [json.loads(l) for l in open(inp, encoding="utf-8") if l.strip()]
+    if stage == "author":
+        rows_in = [b for b in rows_in if b["author"] == engine]
+        convs_fn, rows_fn = stages.author_convs, lambda rows, outs: stages.author_rows(rows, outs, engine)
+    elif stage in ("blind", "verdict"):
+        rows_in = [it for it in rows_in if it["provenance"]["author_model"] != engine]   # the other model reviews
+        if stage == "blind":
+            convs_fn, rows_fn = stages.blind_convs, lambda rows, outs: stages.blind_rows(rows, outs, engine)
+        else:
+            blind_by_id = ({r["id"]: r for r in map(json.loads, open(blind, encoding="utf-8"))} if blind
+                           else {})                       # no blind pass: the verdict prompt omits the blind answer
+            convs_fn = lambda rows: stages.verdict_convs(rows, blind_by_id)                       # noqa: E731
+            rows_fn = lambda rows, outs: stages.verdict_rows(rows, outs, engine)                 # noqa: E731
+    else:
+        raise SystemExit(f"unknown stage {stage!r}")
+    path = Path(out)
+    done = ({r["id"] for r in map(json.loads, open(path, encoding="utf-8")) if r.get("ok")}
+            if path.exists() else set())
+    todo = [r for r in rows_in if r["id"] not in done]
+    random.Random(0).shuffle(todo)                    # every chunk mixes cells and state lengths
+    todo = todo[:limit] if limit else todo
+    chunks = [todo[i:i + chunk] for i in range(0, len(todo), chunk)]
+    print(f"{stage}/{engine}: {len(done)} rows done, {len(todo)} to go in {len(chunks)} chunks", flush=True)
+    if not chunks:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    obj = cls(eager=False) if engine == "qwen" else cls()
+    loads, infer_s, out_tokens, ok = {}, 0.0, 0, 0
+    with open(path, "a", encoding="utf-8") as f:
+        results = obj.generate.map([convs_fn(c) for c in chunks],
+                                   kwargs={"max_tokens": max_tokens, "think_budget": think_budget},
+                                   return_exceptions=True)
+        for k, (rows, r) in enumerate(zip(chunks, results), 1):
+            if isinstance(r, Exception):                  # a failed chunk stays undone; a rerun retries it
+                print(f"chunk {k} FAILED {type(r).__name__}: {str(r)[:300]}", flush=True)
+                continue
+            parsed = rows_fn(rows, r["rows"])
+            for row in parsed:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            f.flush()
+            ok += sum(bool(row.get("ok")) for row in parsed)
+            loads[r["container"]] = r["load_s"]
+            infer_s += r["infer_s"]
+            out_tokens += r["out_tokens"]
+            usd = (sum(loads.values()) + infer_s) / 3600 * USD_PER_HOUR[gpu]
+            print(f"chunk {k}/{len(chunks)}: {r['infer_s']:.0f} s, {r['out_tokens']:,} tokens; ok so far {ok}/"
+                  f"{k * chunk if k < len(chunks) else len(todo)}; load {sum(loads.values()) / 60:.1f} min; "
+                  f"GPU ~${usd:.2f}", flush=True)
 
 
 @app.local_entrypoint()
@@ -211,3 +359,53 @@ def zeroshot(out: str, data: str = "data/raw/opendecisions/opendecisions.jsonl,d
                 n += len(rows)
                 print(f"{target.name}: {n}/{len(items)} rows, {time.perf_counter() - t0:.0f} s", flush=True)
 
+
+
+@app.local_entrypoint()
+def review(inp: str, out_dir: str, engine: str, chunk: int = 48, limit: int = 0, max_tokens: int = 2000,
+           think_budget: int = 0):
+    """Blind pass and verdict pass on the other author's items in one container session (one model load):
+    <out_dir>/blind_<engine>.jsonl and <out_dir>/verdict_<engine>.jsonl. A rerun skips items that have a verdict."""
+    from dopest_model.replica import stages
+    cls, gpu = VERIFIERS[engine]
+    items = [it for it in map(json.loads, open(inp, encoding="utf-8")) if it["provenance"]["author_model"] != engine]
+    out_b, out_v = Path(out_dir) / f"blind_{engine}.jsonl", Path(out_dir) / f"verdict_{engine}.jsonl"
+    done = ({r["id"] for r in map(json.loads, open(out_v, encoding="utf-8")) if r.get("ok")}
+            if out_v.exists() else set())
+    todo = [it for it in items if it["id"] not in done]
+    random.Random(0).shuffle(todo)
+    todo = todo[:limit] if limit else todo
+    chunks = [todo[i:i + chunk] for i in range(0, len(todo), chunk)]
+    print(f"review/{engine}: {len(done)} done, {len(todo)} to go in {len(chunks)} chunks", flush=True)
+    if not chunks:
+        return
+    out_b.parent.mkdir(parents=True, exist_ok=True)
+    kept = cls.with_options(scaledown_window=300)            # the container must survive the gap between two calls
+    obj = kept(eager=False) if engine == "qwen" else kept()
+    loads, infer_s, ok_b, ok_v = {}, 0.0, 0, 0
+    with open(out_b, "a", encoding="utf-8") as fb, open(out_v, "a", encoding="utf-8") as fv:
+        for k, rows in enumerate(chunks, 1):
+            try:
+                rb = obj.generate.remote(stages.blind_convs(rows), max_tokens=max_tokens, think_budget=think_budget)
+                blind = stages.blind_rows(rows, rb["rows"], engine)
+                rv = obj.generate.remote(stages.verdict_convs(rows, {b["id"]: b for b in blind}),
+                                         max_tokens=max_tokens, think_budget=think_budget)
+                verdict = stages.verdict_rows(rows, rv["rows"], engine)
+            except Exception as e:                        # the chunk stays undone; a rerun retries it
+                print(f"chunk {k} FAILED {type(e).__name__}: {str(e)[:300]}", flush=True)
+                continue
+            for row in blind:
+                fb.write(json.dumps(row, ensure_ascii=False) + "\n")
+            for row in verdict:
+                fv.write(json.dumps(row, ensure_ascii=False) + "\n")
+            fb.flush()
+            fv.flush()
+            ok_b += sum(r["ok"] for r in blind)
+            ok_v += sum(r["ok"] for r in verdict)
+            for r in (rb, rv):
+                loads[r["container"]] = r["load_s"]
+                infer_s += r["infer_s"]
+            usd = (sum(loads.values()) + infer_s) / 3600 * USD_PER_HOUR[gpu]
+            print(f"chunk {k}/{len(chunks)}: blind {rb['infer_s']:.0f} s + verdict {rv['infer_s']:.0f} s, "
+                  f"{rb['out_tokens'] + rv['out_tokens']:,} tokens; ok blind {ok_b}, verdict {ok_v}; "
+                  f"load {sum(loads.values()) / 60:.1f} min; GPU ~${usd:.2f}", flush=True)
