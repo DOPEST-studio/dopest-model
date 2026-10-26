@@ -13,5 +13,18 @@
  },
  "model": "pilot-31b-ab-bidir-full",
  "bidir": "full",
- "readout": "option-letter logits, softcap 30"
+ "readout": "option-letter logits, softcap 30",
+ "reasoning": {
+  "gate": 0.8,
+  "weight": 0.5,
+  "temperature": 3.0,
+  "words": 40,
+  "sentences": 2,
+  "max_new_tokens": 80,
+  "max_seconds": 6.5,
+  "min_new_tokens": 40,
+  "max_prompt_tokens": 8000,
+  "budget_usd_per_1000": 0.014,
+  "note": "second pass for unsure choice questions (serve.py --reason): the base model writes a two-sentence rationale ending in 'Answer:', the letters are read after it and mixed 50/50 with the one-pass distribution at temperature 3; gate, weight and temperature chosen on OpenDecisions hard (167 of the 216 items below 0.9 are reasoned at gate 0.8), JevBench public and the sealed-set replica. max_seconds budgets the whole decision (first readout included) on the serving GPU and min_new_tokens is the smallest rationale worth starting; the budget keeps the pooled extra cost under the Jev-class cap"
+ }
 }
