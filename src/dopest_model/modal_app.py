@@ -648,16 +648,17 @@ def scale_sweep_remote(run: str, model_id: str, bidir: str | None, scales: list[
 @app.local_entrypoint()
 def scale_sweep(run: str, scales: str = "0.3,0.5,0.7,1.0", model: str = "google/gemma-4-31B-it", bidir: str = "full",
                 data: str = "jevbench_public=dev/jevbench_public.jsonl,replica_v2=dev/replica_v2.jsonl,jb240=dev/jb240.jsonl",
-                pack_tokens: int = EVAL_PACK_TOKENS, gpu: str = "", fetch: bool = False):
+                pack_tokens: int = EVAL_PACK_TOKENS, gpu: str = "", timeout_min: int = 40, fetch: bool = False):
     """Adapter strength sweep (~$3 on H100 for four factors and three sets): is a weaker delta better on judge items?
+    The function's timeout is the cost cap.
 
-        uv run modal run --detach src/dopest_model/modal_app.py::scale_sweep --run v11-31b-b --gpu H100
+        uv run modal run src/dopest_model/modal_app.py::scale_sweep --run pilot-31b-ab-bidir-full --scales 0.5,0.7,0.85 --gpu H100
     """
     factors = [float(x) for x in scales.split(",")]
     rels = dict(part.split("=", 1) for part in data.split(","))
     if not fetch:
-        fn = scale_sweep_remote.with_options(gpu=gpu) if gpu else scale_sweep_remote
-        r = fn.remote(run, model, bidir or None, factors, rels, pack_tokens)
+        fn = scale_sweep_remote.with_options(gpu=gpu or GPU, timeout=timeout_min * 60)
+        r = wait_for(fn.spawn(run, model, bidir or None, factors, rels, pack_tokens), hours=timeout_min / 60 + 0.25)
         report_cost(r["seconds"], gpu or GPU)
     for factor in factors:
         local = ROOT / "runs" / run / f"scale{factor:g}"
@@ -677,7 +678,8 @@ def reason_file(name: str, variant: str, tag: str = "") -> str:
 
 @app.function(image=image, gpu=GPU, volumes=VOLUMES, timeout=40 * 60)
 def reason_eval_remote(run: str, model_id: str, sets: dict, max_new_tokens: int, words: int, variants: list[str],
-                       graphs: bool, eager_items: int, deadline_min: float, tag: str = "", sentences: int | None = None) -> dict:
+                       graphs: bool, eager_items: int, deadline_min: float, tag: str = "", sentences: int | None = None,
+                       types: tuple = ("choice",), batch: int = 1) -> dict:
     """Second passes through the server's Reasoner (one item at a time, timed), without the server's gate, cost
     budget and time budget, for the given choice items of every set (name -> (data file, ids)), per variant: 'base'
     (adapter off, as served) and 'adapted' (adapter merged in). Rows go to /runs/<run>/<reason_file> as they are
@@ -700,27 +702,47 @@ def reason_eval_remote(run: str, model_id: str, sets: dict, max_new_tokens: int,
             model = fs.merge_adapter(model)                # irreversible: 'base' must come first in `variants`
         elif hasattr(model, "disable_adapter") is False:
             raise ValueError("variant 'base' must run before 'adapted' (the merge cannot be undone)")
-        reasoner = reason.Reasoner(model, tokenizer, graphs=graphs, adapter_off=variant == "base")
+        if batch > 1:
+            from dopest_model.reason_batch import BatchReasoner, Item
+            reasoner = BatchReasoner(model, tokenizer, batch_size=batch, graphs=graphs, adapter_off=variant == "base")
+        else:
+            reasoner = reason.Reasoner(model, tokenizer, graphs=graphs, adapter_off=variant == "base")
         warm_s = reasoner.warm()
-        summary = {"warm_s": round(warm_s), "graph": reasoner.graph is not None, "sets": {}}
+        summary = {"warm_s": round(warm_s), "graph": reasoner.graph is not None, "batch": batch, "sets": {}}
+
+        def row_of(it: dict, opts: list, tokens: list, r) -> dict:
+            return {"id": it["id"], "ids": [o["id"] for o in opts], "logits": [round(x, 5) for x in r.logits],
+                    "rationale": r.rationale, "reached_marker": r.reached_marker, "new_tokens": r.new_tokens,
+                    "marker_tokens": r.marker_tokens, "prompt_tokens": len(tokens), "seconds": round(r.seconds, 3),
+                    "prefill_s": round(r.prefill_seconds, 3), "step_ms": round(r.step_seconds * 1000, 1)}
+
         for name, (rel, ids) in sets.items():
             order = {i: k for k, i in enumerate(ids)}
-            items = sorted((it for it in read(rel) if it["id"] in order and it["question"]["type"] == "choice"),
+            items = sorted((it for it in read(rel) if it["id"] in order and it["question"]["type"] in types),
                            key=lambda it: order[it["id"]])
             out = Path("/runs") / run / reason_file(name, variant, tag)
-            rows, eager = [], []
-            for k, it in enumerate(items):
-                if time.perf_counter() > deadline:
-                    break
+            prepared = []
+            for it in items:
                 opts = options(it["question"])
                 tokens = reasoner.prompt_tokens(it["state"], it["question"]["instructions"], opts, words, sentences)
-                if len(tokens) > reasoner.max_prompt_tokens(max_new_tokens):
-                    continue                                   # the server keeps the one-pass answer for these
+                if len(tokens) <= reasoner.max_prompt_tokens(max_new_tokens):   # the server keeps the one-pass answer
+                    prepared.append((it, opts, tokens))                          # for the longer ones
+            rows, eager = [], []
+            if batch > 1:
+                for start in range(0, len(prepared), batch * 4):
+                    if time.perf_counter() > deadline:
+                        break
+                    chunk = prepared[start:start + batch * 4]
+                    for (it, opts, tokens), r in zip(chunk, reasoner.run([Item(it["id"], tokens, len(opts)) for it, opts, tokens in chunk],
+                                                                         max_new_tokens)):
+                        rows.append(row_of(it, opts, tokens, r))
+                    out.write_text("".join(json.dumps(x, ensure_ascii=False) + "\n" for x in rows))
+                    runs.commit()
+            for k, (it, opts, tokens) in enumerate(prepared if batch == 1 else []):
+                if time.perf_counter() > deadline:
+                    break
                 r = reasoner(tokens, len(opts), max_new_tokens)
-                rows.append({"id": it["id"], "ids": [o["id"] for o in opts], "logits": [round(x, 5) for x in r.logits],
-                             "rationale": r.rationale, "reached_marker": r.reached_marker, "new_tokens": r.new_tokens,
-                             "marker_tokens": r.marker_tokens, "prompt_tokens": len(tokens), "seconds": round(r.seconds, 3),
-                             "prefill_s": round(r.prefill_seconds, 3), "step_ms": round(r.step_seconds * 1000, 1)})
+                rows.append(row_of(it, opts, tokens, r))
                 if k < eager_items and reasoner.graph is not None:   # the same item through the eager step, for the record
                     graph, reasoner.graph = reasoner.graph, None
                     e = reasoner(tokens, len(opts), max_new_tokens)
@@ -755,27 +777,29 @@ def reason_eval(run: str = "pilot-31b-ab-bidir-full", model: str = "google/gemma
                 data: str = "jevbench_public=dev/jevbench_public.jsonl,replica_v2=dev/replica_v2.jsonl",
                 max_new_tokens: int = 80, words: int = 40, variants: str = "base", n: int = 0, gpu: str = "",
                 timeout_min: int = 30, eager_items: int = 0, no_graphs: bool = False, tag: str = "", sentences: int = 2,
-                fetch: bool = False):
+                types: str = "choice", batch: int = 1, fetch: bool = False):
     """Second passes for the gated choice items of the given sets (ids from runs/reason/gate_<name>.txt when that
     file exists, written by `scripts/reason_report.py --write-gate`; else every choice item), one item at a time;
     words and max_new_tokens default to reason.Policy's. About $2 on H100 for the 62 gated public and replica items in
     both variants (the function's timeout is the cost cap); --tag keeps a partial run (e.g. a latency check on another
-    GPU) apart from the full rows:
+    GPU) apart from the full rows; --batch 8 decodes eight items per step (reason_batch.py, several times faster,
+    no latency figures worth reading):
 
         uv run modal run src/dopest_model/modal_app.py::reason_eval --variants base,adapted --gpu H100 --eager-items 3
         uv run modal run src/dopest_model/modal_app.py::reason_eval --n 12 --gpu A100-80GB --timeout-min 15 --tag a100
     """
+    kinds = tuple(sorted(set(types.split(","))))
     sets = {}
     for name, rel in (part.split("=", 1) for part in data.split(",")):
         gate_file = ROOT / "runs" / "reason" / f"gate_{name}.txt"
         ids = [l.strip() for l in open(gate_file, encoding="utf-8") if l.strip()] if gate_file.exists() else \
-            [it["id"] for it in map(json.loads, open(ROOT / "data" / rel, encoding="utf-8")) if it["question"]["type"] == "choice"]
+            [it["id"] for it in map(json.loads, open(ROOT / "data" / rel, encoding="utf-8")) if it["question"]["type"] in kinds]
         sets[name] = (rel, ids[:n] if n else ids)
     names = variants.split(",")
     if not fetch:
         fn = reason_eval_remote.with_options(gpu=gpu or GPU, timeout=timeout_min * 60)
         r = wait_for(fn.spawn(run, model, sets, max_new_tokens, words, names, not no_graphs, eager_items, timeout_min - 2, tag,
-                              sentences or None),
+                              sentences or None, kinds, batch),
                      hours=timeout_min / 60 + 0.25)
         print(f"{r['gpu']}: model loaded in {r['load_s']} s")
         for variant, s in r["variants"].items():

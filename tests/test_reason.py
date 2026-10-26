@@ -31,7 +31,10 @@ def test_blend_and_gate():
 
 def test_policy_reads_the_calibration_section_and_prices_a_pass():
     policy = Policy.from_calibration({"temperatures": {}, "reasoning": {"gate": 0.7, "unknown": 1}}, budget_usd_per_1000=None)
-    assert policy.gate == 0.7 and policy.weight == 0.5 and policy.budget_usd_per_1000 == 0.014
+    assert policy.gate == 0.7 and policy.weight == 0.5 and policy.budget_usd_per_1000 == 0.014 and policy.types == ("choice", "score")
+    assert Policy.from_calibration({"reasoning": {"types": ["choice"]}}).types == ("choice",)
+    typed = Policy.from_calibration({"reasoning": {"gate": 0.8, "gates": {"score": 0.7}}})
+    assert typed.gate_for("score") == 0.7 and typed.gate_for("choice") == 0.8 and Policy().gate_for("score") == 0.8
     assert Policy.from_calibration({}, budget_usd_per_1000=0.02).budget_usd_per_1000 == 0.02
     assert policy.cost(2500, 96) == pytest.approx((2500 * 0.09 + 96 * 0.34) / 1e6)
 

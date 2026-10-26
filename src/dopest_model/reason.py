@@ -38,6 +38,8 @@ IN_USD_PER_M, OUT_USD_PER_M = 0.09, 0.34       # OpenRouter list prices of googl
 class Policy:
     """When to reason and how to mix (tuned offline), plus the cost rules of the second pass."""
     gate: float = 0.8                    # reason when the one-pass top probability is below this
+    types: tuple = ("choice", "score")   # question types that get the second pass (levels of a score act as options)
+    gates: dict | None = None            # per-type gates overriding `gate`, e.g. {"choice": 0.75}
     weight: float = 0.5                  # weight of the reasoned distribution in the mix
     temperature: float = 3.0             # temperature of the reasoned letter logits
     words: int = 40                      # rationale length asked for: a complete short rationale kept the gain of an
@@ -53,7 +55,13 @@ class Policy:
     def from_calibration(cls, calibration: dict, **overrides) -> "Policy":
         """Defaults, then the calibration file's optional 'reasoning' section, then explicit overrides (None: keep)."""
         values = {k: v for k, v in calibration.get("reasoning", {}).items() if k in cls.__dataclass_fields__}
-        return cls(**(values | {k: v for k, v in overrides.items() if v is not None}))
+        values = values | {k: v for k, v in overrides.items() if v is not None}
+        if "types" in values:
+            values["types"] = tuple(values["types"])                  # JSON lists become tuples
+        return cls(**values)
+
+    def gate_for(self, qtype: str) -> float:
+        return (self.gates or {}).get(qtype, self.gate)
 
     def cost(self, prompt_tokens: int, new_tokens: int) -> float:
         """What the board bills for one second pass, in dollars."""

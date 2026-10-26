@@ -10,9 +10,9 @@ tags: [typed-decisions, decision-model, calibration, lora, jevbench, gemma4]
 
 DOPEST is a typed-decision model: it reads a **state** (text or JSON) and a **question with a closed set of
 options**, and returns a calibrated probability for every option in one forward pass. When the one-pass answer to a
-choice question is unsure, an optional second pass lets the base model write a two-sentence rationale and reads the
-options again after it (`--reason`, below); otherwise no text is generated. Version 1.1 keeps the 1.0 adapter and
-calibration and adds that second pass.
+choice or score question is unsure, an optional second pass lets the base model write a two-sentence rationale and
+reads the options again after it (`--reason`, below); otherwise no text is generated. Version 1.1 keeps the 1.0
+adapter and calibration and adds that second pass.
 
 - **choice**: a distribution over named options (more than 16 options are read in groups, then a final round)
 - **yes/no** (`noul`): P(yes)
@@ -42,11 +42,12 @@ distribution. Four things differ from a plain causal readout:
    +0.9 on the public JevBench items, both inside their intervals) for twice the choice-question latency and about
    70% more input tokens per decision. Off by default: the extra tokens would put the model outside the JevBench
    Jev-class cost cap (twice the reference model's cost per decision).
-4. **Reasoning at uncertainty** (`--reason`, version 1.1). When the top probability of a choice question with at
-   most 16 options is below 0.8, the base model (adapter switched off) receives the same state, criterion and
-   options and writes a rationale of at most two sentences and 40 words that ends in `Answer:`; the option letters
-   are read right after it and the two distributions are mixed half and half (the second one at temperature 3; every
-   number of this section is in `calibration.json`, section `reasoning`). The adapter was trained only at the answer position under the
+4. **Reasoning at uncertainty** (`--reason`, version 1.1). When the top probability of a choice question
+   with at most 16 options is below 0.75, or of a score question below 0.8, the base model (adapter switched off)
+   receives the same state, criterion and options (the levels of a score are its options) and writes a rationale of
+   at most two sentences and 40 words that ends in `Answer:`; the option letters are read right after it and the two
+   distributions are mixed half and half (the second one at temperature 3; every number of this section is in
+   `calibration.json`, section `reasoning`). The adapter was trained only at the answer position under the
    bidirectional mask, so its own generations are untested; the base model's causal readout after its reasoning is
    an independent second view of the question. The pass decodes one token at a time through a captured CUDA graph
    over a static KV cache (about 50 ms per token on an H100, 76 ms on an A100 80 GB) and stops at the marker or at 80
@@ -55,12 +56,16 @@ distribution. Four things differ from a plain causal readout:
    read the answer (the board fails any decision slower than 10 seconds). A cost budget (0.014 USD per 1,000
    decisions on average, at the base model's list prices for the re-read state and the generated tokens) bounds how
    many second passes a run may take, so the pooled cost stays inside the Jev-class cap. Measured with our scoring
-   (JevBench v1.5 rules), with rationales allowed to finish: OpenDecisions hard tier 79.1 → 81.5 Capability (167 of
-   921 decisions reasoned), JevBench public items +1.0 to +2.0 depending on the rationale length allowed. These are
-   upper bounds for the served model: under the time budget, the longest states leave room for fewer tokens (in the
-   A100 run below most second passes on the public items ran into it), and a rationale cut mid-sentence after 60
-   tokens kept only about a third of the hard-tier gain. The second read without any rationale lowered the hard-tier
-   score by 1.7 points, so no second pass is taken when the budget cannot fit a short rationale.
+   (JevBench v1.5 rules), with rationales allowed to finish and both question types gated as shipped: all of
+   OpenDecisions 86.2 → 88.9 Capability (351 of 2,352 decisions reasoned; choice alone 86.2 → 88.3, score alone
+   86.2 → 87.1), the hard tier 79.1 → 81.1, the 231 public JevBench items 82.0 → 85.0; on our replica of the sealed
+   set, whose choice questions the one pass already gets right, the mix cost 0.5 points. These are upper bounds for
+   the served model: under the time budget, the longest states leave room for fewer tokens (in the A100 run below
+   most second passes on the public items ran into it), and a rationale cut mid-sentence after 60 tokens kept only
+   about a third of the hard-tier gain. The second read without any rationale lowered the hard-tier score by 1.7
+   points, so no second pass is taken when the budget cannot fit a short rationale. Scaling the adapter down
+   (0.5 to 0.85 of its trained strength) raised the one-pass score accuracy by about 4 points but did not add to the
+   second pass, so the adapter is served at full strength.
 
 ## Serving
 
@@ -93,8 +98,8 @@ the second pass (the 1.0 server, adapter not merged), on one H100 80 GB: median 
 3.7k tokens), 702 input tokens per decision (about 0.063 USD per 1,000 decisions at the board's reference price for
 the base model); merging the adapter brings the median to about 60 ms in-process, and with `--orders 2` choice
 questions take twice as long. With `--reason`, on one A100 80 GB (the board's GPU), the cost budget raised to 0.03 for
-the run so that every eligible item took the pass: median 129 ms, p95 6.5 s, maximum 6.5 s; 21 of the 231 decisions
-took the second pass and 4 more were skipped for lack of time; 832 input and 5.4 output tokens per decision (about
+the run so that every eligible item took the pass: median 126 ms, p95 6.5 s, maximum 6.5 s; 20 of the 231 decisions
+took the second pass and 5 more were skipped for lack of time; 832 input and 5.3 output tokens per decision (about
 0.077 USD per 1,000 on the public items, which are longer than the board's average; on the board's 1,624 items the
 first pass cost 0.049 USD per 1,000 and the budget adds at most 0.014). The server passes JevBench's adapter
 conformance kit (`check_adapter` with the `typesafe` adapter: 4 fixture tasks, 0 violations).
@@ -149,8 +154,8 @@ below about 5 points on it are inside its 95% interval.
 
 - Trained on synthetic decisions only; no human-labelled data. Weakest on long numeric reasoning (multi-step
   arithmetic over tables) and on non-English states (about 20 points below English on hard items).
-- One forward pass per decision by default. The second pass covers only unsure choice questions, is capped at two
-  sentences and the decision's time budget, and does not run for yes/no or score questions, so questions that need
-  several arithmetic steps are still mostly answered from pattern, not computation.
+- One forward pass per decision by default. The second pass covers only unsure choice and score questions, is
+  capped at two sentences and the decision's time budget, and does not run for yes/no questions, so questions that
+  need several arithmetic steps are still mostly answered from pattern, not computation.
 - Calibration was fitted on English public items; validate the thresholds on your own data before automating with
   them.

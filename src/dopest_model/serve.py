@@ -172,7 +172,7 @@ class Decider:
                 ids, probs = read_in_groups(opts, reader)
                 if qtype == "choice" and self.orders == 2 and len(opts) > 1:
                     ids, probs = average_orders((ids, probs), read_in_groups(opts[::-1], reader))
-                if qtype == "choice" and self.reasoner and len(opts) <= GROUP and unsure(probs, self.policy.gate):
+                if self.reasoner and qtype in self.policy.types and len(opts) <= GROUP and unsure(probs, self.policy.gate_for(qtype)):
                     probs = self.reason(state, q.get("instructions", ""), opts, probs, started)
                 if self.budget:
                     self.budget.tick()
