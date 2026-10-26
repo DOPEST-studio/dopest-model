@@ -27,9 +27,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("files", nargs="+")
     parser.add_argument("--limit", type=float, default=0.5, help="flag items with a larger overlap share")
+    parser.add_argument("--against", default=",".join(EVAL),
+                        help="reference files, comma-separated (default: the evaluation sets; for an evaluation set pass the training files)")
     args = parser.parse_args()
     ref = set()
-    for path in EVAL:
+    for path in args.against.split(","):
         for r in map(json.loads, open(path, encoding="utf-8")):
             ref |= grams(text(r["state"]) + " " + r["question"]["instructions"])
     scores = []
