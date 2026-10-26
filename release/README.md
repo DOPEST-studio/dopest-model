@@ -98,8 +98,8 @@ the second pass (the 1.0 server, adapter not merged), on one H100 80 GB: median 
 3.7k tokens), 702 input tokens per decision (about 0.063 USD per 1,000 decisions at the board's reference price for
 the base model); merging the adapter brings the median to about 60 ms in-process, and with `--orders 2` choice
 questions take twice as long. With `--reason`, on one A100 80 GB (the board's GPU), the cost budget raised to 0.03 for
-the run so that every eligible item took the pass: median 129 ms, p95 6.5 s, maximum 6.5 s; 21 of the 231 decisions
-took the second pass and 4 more were skipped for lack of time; 832 input and 5.4 output tokens per decision (about
+the run so that every eligible item took the pass: median 126 ms, p95 6.5 s, maximum 6.5 s; 20 of the 231 decisions
+took the second pass and 5 more were skipped for lack of time; 832 input and 5.3 output tokens per decision (about
 0.077 USD per 1,000 on the public items, which are longer than the board's average; on the board's 1,624 items the
 first pass cost 0.049 USD per 1,000 and the budget adds at most 0.014). The server passes JevBench's adapter
 conformance kit (`check_adapter` with the `typesafe` adapter: 4 fixture tasks, 0 violations).
